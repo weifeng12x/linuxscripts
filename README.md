@@ -1,1 +1,1 @@
-# linuxscripts
+Personal use script
