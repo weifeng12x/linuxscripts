@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# change-ssh-port.sh
+# Ubuntu-friendly script to change SSH port by editing sshd_config / drop-ins.
+# Prompts:
+#  1) current port
+#  2) new port
+#
+# Safety:
+# - Creates timestamped backups of modified files
+# - Validates port range
+# - Tests sshd config before restart
+# - If UFW is active, auto-allow the new port (does NOT remove the old port rule)
+
+require_root() {
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
+    echo "ERROR: Please run as root: sudo $0"
+    exit 1
+  fi
+}
+
+need_cmd() {
+  command -v "$1" >/dev/null 2>&1 || { echo "ERROR: Missing command: $1"; exit 1; }
+}
+
+is_valid_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  return 0
+}
+
+port_in_use() {
+  local p="$1"
+  if command -v ss >/dev/null 2>&1; then
+    # Match :PORT at end or before whitespace
+    ss -ltnH 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\])${p}\$" && return 0 || return 1
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -iTCP -sTCP:LISTEN -P 2>/dev/null | awk '{print $9}' | grep -Eq ":${p}->|:${p}\$" && return 0 || return 1
+  else
+    return 1
+  fi
+}
+
+backup_file() {
+  local f="$1"
+  local ts="$2"
+  if [[ -f "$f" ]]; then
+    cp -a "$f" "${f}.bak.${ts}"
+  fi
+}
+
+detect_effective_port_default() {
+  # Try to read effective port from sshd -T (may output multiple ports; we take the first)
+  if command -v sshd >/dev/null 2>&1; then
+    sshd -T 2>/dev/null | awk '/^port[[:space:]]+/ {print $2; exit}' || true
+  fi
+}
+
+restart_ssh_service() {
+  local svc=""
+  if systemctl list-unit-files 2>/dev/null | grep -qE '^ssh\.service'; then
+    svc="ssh"
+  elif systemctl list-unit-files 2>/dev/null | grep -qE '^sshd\.service'; then
+    svc="sshd"
+  else
+    echo "WARNING: Could not detect ssh service name (ssh/sshd). Please restart it manually."
+    return 0
+  fi
+
+  systemctl restart "$svc"
+  systemctl is-active --quiet "$svc" || {
+    echo "ERROR: SSH service failed to start. Check logs: journalctl -u $svc -xe"
+    exit 1
+  }
+}
+
+ufw_allow_new_port_if_active() {
+  local p="$1"
+  if command -v ufw >/dev/null 2>&1; then
+    if ufw status 2>/dev/null | grep -q "Status: active"; then
+      # Allow new port; do not remove old automatically to avoid lockout
+      ufw --force allow "${p}/tcp" >/dev/null || true
+      echo "UFW is active: allowed ${p}/tcp."
+    fi
+  fi
+}
+
+main() {
+  require_root
+  need_cmd sed
+  need_cmd grep
+  need_cmd systemctl
+
+  local default_current
+  default_current="$(detect_effective_port_default)"
+  default_current="${default_current:-22}"
+
+  echo "Detected current SSH port (best guess): ${default_current}"
+  read -r -p "Enter CURRENT SSH port [default: ${default_current}]: " CURRENT_PORT
+  CURRENT_PORT="${CURRENT_PORT:-$default_current}"
+
+  read -r -p "Enter NEW SSH port: " NEW_PORT
+
+  if ! is_valid_port "$CURRENT_PORT"; then
+    echo "ERROR: Invalid current port: $CURRENT_PORT"
+    exit 1
+  fi
+  if ! is_valid_port "$NEW_PORT"; then
+    echo "ERROR: Invalid new port: $NEW_PORT"
+    exit 1
+  fi
+  if [[ "$CURRENT_PORT" == "$NEW_PORT" ]]; then
+    echo "Nothing to do: current port equals new port ($NEW_PORT)."
+    exit 0
+  fi
+
+  if port_in_use "$NEW_PORT"; then
+    echo "ERROR: New port $NEW_PORT appears to be in use (LISTEN). Choose another port."
+    exit 1
+  fi
+
+  local TS
+  TS="$(date +%Y%m%d-%H%M%S)"
+
+  # Candidate config files
+  local files=("/etc/ssh/sshd_config")
+  if [[ -d /etc/ssh/sshd_config.d ]]; then
+    # Add only regular .conf files
+    while IFS= read -r -d '' f; do files+=("$f"); done < <(find /etc/ssh/sshd_config.d -maxdepth 1 -type f -name "*.conf" -print0 2>/dev/null || true)
+  fi
+
+  local replaced=0
+  local modified_files=()
+
+  # Replace only active "Port <CURRENT_PORT>" lines (not commented)
+  for f in "${files[@]}"; do
+    [[ -f "$f" ]] || continue
+    if grep -qE "^[[:space:]]*Port[[:space:]]+${CURRENT_PORT}([[:space:]]*(#.*)?)?$" "$f"; then
+      backup_file "$f" "$TS"
+      sed -i -E "s/^([[:space:]]*Port[[:space:]]+)${CURRENT_PORT}([[:space:]]*(#.*)?)?$/\\1${NEW_PORT}\\2/" "$f"
+      replaced=$((replaced + 1))
+      modified_files+=("$f")
+    fi
+  done
+
+  if (( replaced == 0 )); then
+    # Could not find a matching "Port CURRENT_PORT" line; add a drop-in file to enable NEW_PORT.
+    # NOTE: This may result in sshd listening on both old and new ports if old port is configured elsewhere.
+    local dropin_dir="/etc/ssh/sshd_config.d"
+    local dropin_file="${dropin_dir}/99-custom-port.conf"
+
+    if [[ ! -d "$dropin_dir" ]]; then
+      mkdir -p "$dropin_dir"
+    fi
+
+    backup_file "$dropin_file" "$TS"
+    cat > "$dropin_file" <<EOF
+# Managed by change-ssh-port.sh on ${TS}
+# Adds an additional SSH port. If you want to remove the old port, update the existing config that sets it.
+Port ${NEW_PORT}
+EOF
+    modified_files+=("$dropin_file")
+    echo "WARNING: Did not find an active 'Port ${CURRENT_PORT}' line to replace."
+    echo "Added ${NEW_PORT} via ${dropin_file} (this may keep the old port active)."
+  fi
+
+  # Test sshd config before restart
+  if command -v sshd >/dev/null 2>&1; then
+    if ! sshd -t 2>/dev/null; then
+      echo "ERROR: sshd config test failed. Reverting backups..."
+      for f in "${modified_files[@]}"; do
+        if [[ -f "${f}.bak.${TS}" ]]; then
+          cp -a "${f}.bak.${TS}" "$f"
+        else
+          # If we created a new file with no previous backup, remove it
+          [[ -f "$f" ]] && rm -f "$f"
+        fi
+      done
+      exit 1
+    fi
+  else
+    echo "WARNING: 'sshd' binary not found; skipping config test."
+  fi
+
+  # If firewall is active, allow the new port first
+  ufw_allow_new_port_if_active "$NEW_PORT"
+
+  # Restart SSH service
+  restart_ssh_service
+
+  echo
+  echo "SUCCESS: SSH port change applied."
+  echo "New port: ${NEW_PORT}"
+  echo "Current session (if any) should remain; NEW connections must use: ssh -p ${NEW_PORT} user@host"
+  echo
+  echo "Listening ports (sshd):"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntp 2>/dev/null | grep -E 'sshd|:('"$NEW_PORT"'|'"$CURRENT_PORT"')' || true
+  fi
+  echo
+  echo "Backups created with suffix: .bak.${TS}"
+}
+
+main "$@"
